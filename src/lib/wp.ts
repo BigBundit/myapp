@@ -3,6 +3,7 @@ import { basicAuth, fetchJson } from './http.js';
 
 export type WpRequestOptions = {
   auth?: boolean;
+  headers?: Record<string, string>;
 };
 
 function addParams(url: URL, params: Record<string, string | number | boolean | undefined>) {
@@ -27,7 +28,7 @@ export function wpRestRouteUrl(path: string, params: Record<string, string | num
 }
 
 export async function wpGet<T>(path: string, params: Record<string, string | number | boolean | undefined> = {}, options: WpRequestOptions = {}) {
-  const headers: Record<string, string> = {};
+  const headers: Record<string, string> = { ...(options.headers || {}) };
   if (options.auth && hasWpAuth) {
     headers.Authorization = basicAuth(config.wpUsername, config.wpAppPassword);
   }
