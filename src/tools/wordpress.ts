@@ -72,72 +72,122 @@ export function registerWordPressTools(server: McpServer) {
   server.registerTool(
     'find_url_usage',
     {
-      description: 'Scan public WordPress pages/posts and find which content contains a target URL. Useful for locating where a link is used. Read-only.',
+      description: 'Find which public WordPress pages/posts contain a target URL. Uses a fast WordPress content search first, then a bounded parallel scan if needed. Read-only.',
       inputSchema: z.object({
         targetUrl: z.string().min(1),
         postTypes: z.array(z.enum(['page', 'post'])).min(1).default(['page', 'post']),
-        maxPagesPerType: z.number().int().min(1).max(100).optional().describe('Safety cap for REST pagination; each REST page contains up to 100 items')
+        maxPagesPerType: z.number().int().min(1).max(50).optional().describe('Fallback scan cap; each REST page contains up to 100 items. Default comes from FIND_URL_MAX_PAGES.'),
+        concurrency: z.number().int().min(1).max(10).default(6).describe('Parallel requests used only during the fallback scan')
       })
     },
-    async ({ targetUrl, postTypes, maxPagesPerType }) => {
+    async ({ targetUrl, postTypes, maxPagesPerType, concurrency }) => {
       try {
         const needle = normalizeComparableUrl(targetUrl);
-        const maxPages = Math.min(maxPagesPerType ?? config.findUrlMaxPages, 100);
+        const searchTerm = extractSearchTerm(targetUrl);
         const matches: Array<Record<string, unknown>> = [];
+        const seen = new Set<string>();
+        let searchedCandidates = 0;
+
+        // Fast path: WordPress searches post_title/post_excerpt/post_content server-side.
+        // We then verify the exact URL against only those candidates.
+        const fastResults = await Promise.all(
+          postTypes.map(async (postType) => {
+            const endpoint = postType === 'page' ? '/wp/v2/pages' : '/wp/v2/posts';
+            try {
+              const res = await wpGet<any[]>(endpoint, {
+                search: searchTerm,
+                per_page: 100,
+                status: 'publish',
+                _fields: 'id,slug,link,title,content,modified'
+              }, { auth: hasWpAuth });
+              return { postType, items: res.data };
+            } catch {
+              return { postType, items: [] as any[] };
+            }
+          })
+        );
+
+        for (const result of fastResults) {
+          for (const item of result.items) {
+            searchedCandidates += 1;
+            addMatchIfPresent(item, result.postType, targetUrl, needle, matches, seen);
+          }
+        }
+
+        if (matches.length > 0) {
+          return textResult({
+            targetUrl,
+            searchTerm,
+            mode: 'fast_content_search',
+            searchedCandidates,
+            scanned: searchedCandidates,
+            count: matches.length,
+            truncated: false,
+            matches
+          });
+        }
+
+        // Fallback: fetch page 1 for metadata, then scan remaining REST pages in parallel.
+        const maxPages = Math.min(maxPagesPerType ?? config.findUrlMaxPages, 50);
         let scanned = 0;
         let truncated = false;
+        const scanSummaries: Array<Record<string, unknown>> = [];
 
         for (const postType of postTypes) {
           const endpoint = postType === 'page' ? '/wp/v2/pages' : '/wp/v2/posts';
-          for (let page = 1; page <= maxPages; page++) {
-            let batch: any[];
-            let totalPages = 1;
-            try {
-              const res = await wpGet<any[]>(endpoint, {
+          const first = await wpGet<any[]>(endpoint, {
+            per_page: 100,
+            page: 1,
+            status: 'publish',
+            _fields: 'id,slug,link,title,content,modified'
+          }, { auth: hasWpAuth });
+
+          const totalPages = Math.max(1, Number.parseInt(first.response.headers.get('x-wp-totalpages') || '1', 10));
+          const pagesToScan = Math.min(totalPages, maxPages);
+          if (totalPages > pagesToScan) truncated = true;
+
+          for (const item of first.data) {
+            scanned += 1;
+            addMatchIfPresent(item, postType, targetUrl, needle, matches, seen);
+          }
+
+          const remainingPages = Array.from({ length: Math.max(0, pagesToScan - 1) }, (_, i) => i + 2);
+          const batches = chunk(remainingPages, concurrency);
+
+          for (const batch of batches) {
+            const responses = await Promise.all(
+              batch.map((page) => wpGet<any[]>(endpoint, {
                 per_page: 100,
                 page,
                 status: 'publish',
                 _fields: 'id,slug,link,title,content,modified'
-              }, { auth: hasWpAuth });
-              batch = res.data;
-              totalPages = Number.parseInt(res.response.headers.get('x-wp-totalpages') || '1', 10);
-            } catch (error: any) {
-              if (page > 1 && /400|rest_post_invalid_page_number/i.test(String(error?.message))) break;
-              throw error;
-            }
+              }, { auth: hasWpAuth }))
+            );
 
-            for (const item of batch) {
-              scanned += 1;
-              const html = String(item?.content?.rendered ?? '');
-              const normalizedHtml = html
-                .replace(/&amp;/g, '&')
-                .replace(/&#038;/g, '&');
-
-              const directHit = normalizedHtml.includes(targetUrl);
-              const normalizedHit = normalizeComparableUrlInText(normalizedHtml).includes(needle);
-              if (directHit || normalizedHit) {
-                matches.push({
-                  id: item.id,
-                  postType,
-                  title: stripHtml(item?.title?.rendered ?? ''),
-                  url: item.link,
-                  slug: item.slug,
-                  modified: item.modified
-                });
+            for (const response of responses) {
+              for (const item of response.data) {
+                scanned += 1;
+                addMatchIfPresent(item, postType, targetUrl, needle, matches, seen);
               }
             }
-
-            if (page >= totalPages) break;
-            if (page === maxPages && totalPages > maxPages) truncated = true;
           }
+
+          scanSummaries.push({ postType, totalPages, pagesScanned: pagesToScan });
         }
 
         return textResult({
           targetUrl,
+          searchTerm,
+          mode: 'parallel_fallback_scan',
+          searchedCandidates,
           scanned,
           count: matches.length,
           truncated,
-          matches
+          scanSummaries,
+          matches,
+          note: truncated
+            ? 'Fallback scan hit the configured page limit. Increase maxPagesPerType only if a deeper scan is required.'
+            : undefined
         });
       } catch (error) {
         return errorResult(error);
@@ -240,6 +290,63 @@ export function registerWordPressTools(server: McpServer) {
       }
     }
   );
+}
+
+function addMatchIfPresent(
+  item: any,
+  postType: 'page' | 'post',
+  targetUrl: string,
+  needle: string,
+  matches: Array<Record<string, unknown>>,
+  seen: Set<string>
+) {
+  const html = String(item?.content?.rendered ?? '');
+  const normalizedHtml = html
+    .replace(/&amp;/g, '&')
+    .replace(/&#038;/g, '&');
+
+  const directHit = normalizedHtml.includes(targetUrl);
+  const normalizedHit = normalizeComparableUrlInText(normalizedHtml).includes(needle);
+  if (!directHit && !normalizedHit) return;
+
+  const key = `${postType}:${item.id}`;
+  if (seen.has(key)) return;
+  seen.add(key);
+
+  matches.push({
+    id: item.id,
+    postType,
+    title: stripHtml(item?.title?.rendered ?? ''),
+    url: item.link,
+    slug: item.slug,
+    modified: item.modified
+  });
+}
+
+function extractSearchTerm(targetUrl: string): string {
+  try {
+    const url = new URL(targetUrl);
+    const parts = decodeURIComponent(url.pathname)
+      .split(/[^\p{L}\p{N}]+/u)
+      .map((part) => part.trim())
+      .filter((part) => part.length >= 4);
+
+    if (parts.length > 0) {
+      return parts.sort((a, b) => b.length - a.length)[0];
+    }
+
+    return url.hostname.replace(/^www\./, '').split('.')[0] || targetUrl;
+  } catch {
+    return targetUrl;
+  }
+}
+
+function chunk<T>(items: T[], size: number): T[][] {
+  const result: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    result.push(items.slice(i, i + size));
+  }
+  return result;
 }
 
 function normalizeComparableUrlInText(text: string): string {
