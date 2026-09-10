@@ -19,6 +19,7 @@ export const config = {
   wpAppPassword: process.env.WP_APP_PASSWORD?.replace(/\s+/g, '') || '',
   wcConsumerKey: process.env.WC_CONSUMER_KEY?.trim() || '',
   wcConsumerSecret: process.env.WC_CONSUMER_SECRET?.trim() || '',
+  urlFinderToken: process.env.BNH_URL_FINDER_TOKEN?.trim() || '',
   port: intEnv('PORT', 3000),
   host: process.env.HOST?.trim() || '0.0.0.0',
   mcpBearerToken: process.env.MCP_BEARER_TOKEN?.trim() || '',
@@ -28,3 +29,4 @@ export const config = {
 
 export const hasWpAuth = Boolean(config.wpUsername && config.wpAppPassword);
 export const hasWooAuth = Boolean(config.wcConsumerKey && config.wcConsumerSecret);
+export const hasUrlFinderToken = Boolean(config.urlFinderToken);
