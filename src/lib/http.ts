@@ -19,9 +19,12 @@ export async function fetchJson<T>(url: string, init: RequestInit = {}): Promise
     const response = await fetch(url, {
       ...init,
       signal: controller.signal,
+      redirect: 'follow',
       headers: {
-        Accept: 'application/json',
-        'User-Agent': 'wordpress-mcp/1.0',
+        Accept: 'application/json, text/plain, */*',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36',
+        'Cache-Control': 'no-cache',
+        Pragma: 'no-cache',
         ...(init.headers || {})
       }
     });
@@ -37,7 +40,9 @@ export async function fetchJson<T>(url: string, init: RequestInit = {}): Promise
     try {
       data = JSON.parse(text) as T;
     } catch {
-      throw new Error(`Expected JSON but received a non-JSON response from ${url}`);
+      const contentType = response.headers.get('content-type') || 'unknown';
+      const preview = text.replace(/\s+/g, ' ').slice(0, 220);
+      throw new Error(`Expected JSON but received non-JSON from ${url} (content-type: ${contentType}; preview: ${preview})`);
     }
 
     return { data, response, elapsedMs };
