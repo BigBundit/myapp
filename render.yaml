@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: bnh-wordpress-mcp
+    runtime: docker
+    plan: free
+    region: singapore
+    healthCheckPath: /health
+    envVars:
+      - key: WP_BASE_URL
+        value: https://www.bnhhospital.com
+      - key: REQUEST_TIMEOUT_MS
+        value: "15000"
+      - key: FIND_URL_MAX_PAGES
+        value: "30"
